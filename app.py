@@ -24,6 +24,12 @@ TICKET_POOL = {
           "No connection at all. Is the whole street affected?",
           "Wala pong signal, ilang minuto na",
           "Router blinking red, can't connect to anything"],
+    "C": ["Why was I charged twice this month? Please check my bill",
+          "Sobra ang singil sa bill ko, dalawang beses ang charge",
+          "My statement shows a duplicate charge, please fix",
+          "Mali ang bill ko ngayong buwan, bakit may dagdag?",
+          "Overcharged on my latest statement",
+          "Internet is fine but my bill is wrong, charged for a service I cancelled"],
     "B": ["Router blinking red, can't connect to anything",
           "Slow internet lately, maybe Wi-Fi problem?",
           "Intermittent connection, drops every few minutes",
@@ -46,6 +52,9 @@ BASE_A = dict(routers_total=180, area="Cabinet 14, Riverside (fibre)", map_accur
 BASE_B = dict(routers_total=240, area="Tower 7, Hillside (fixed-wireless)", map_accuracy=0.70,
               similar_past_incidents=0, typical_repair_hours=None)
 
+BASE_C = dict(routers_total=200, area="Metro East, many areas (not one cabinet)", map_accuracy=0.95,
+              similar_past_incidents=0, typical_repair_hours=None)
+
 FRAMES = {
     "A. Clean fibre cut": [
         frame(0, 0, False, 0, "Normal operation", BASE_A),
@@ -64,11 +73,33 @@ FRAMES = {
               BASE_B, power=True, map_acc=0.92),
         frame(50, 180, True, 31, "NOC tower alarm finally appears", BASE_B, power=True, map_acc=0.92),
     ],
+    "C. Billing lookalike": [
+        frame(0, 2, False, 3, "Normal operation, the usual billing questions", BASE_C),
+        frame(10, 2, False, 18, "Complaints start rising after statements are emailed", BASE_C),
+        frame(20, 3, False, 44, "Ticket spike across many areas; routers and alarms look healthy", BASE_C),
+        frame(30, 3, False, 71, "Spike continues; the network is still clean", BASE_C),
+        frame(45, 2, False, 52, "Billing team finds a duplicated-charge batch error", BASE_C),
+    ],
 }
 SCENARIOS = list(FRAMES)
 
 
 # ---------- 2. PLAIN-CODE RULES (the AI never sets the tier) ----------
+BILLING_WORDS = ("bill", "charge", "statement", "singil", "bayad")
+
+
+def billing_share(tickets):
+    """Plain keyword check (the AI does this better, but this works with no AI)."""
+    if not tickets:
+        return 0.0
+    hits = sum(any(w in t.lower() for w in BILLING_WORDS) for t in tickets)
+    return hits / len(tickets)
+
+
+def has_network_evidence(ev):
+    return ev["routers_silent"] / ev["routers_total"] >= 0.25 or ev["alarm_seen"]
+
+
 def score(ev):
     share = ev["routers_silent"] / ev["routers_total"]
     points, reasons = 0, []
@@ -105,6 +136,10 @@ def score(ev):
         tier = "MEDIUM"
     else:
         tier = "LOW"
+    if tier != "LOW" and not has_network_evidence(ev):
+        tier = "LOW"
+        reasons.append("RULE: a ticket spike alone is never enough; there is no network evidence "
+                       "(few silent routers, no alarm), so confidence is capped at LOW")
     return tier, reasons
 
 
@@ -115,7 +150,7 @@ def lead_time(frames):
 
 
 # ---------- 3. FALLBACK (works with no AI at all) ----------
-def fallback(ev, tier, reasons):
+def fallback(ev, tier, reasons, tickets=()):
     out = {
         "source": "TEMPLATE FALLBACK (AI explanation unavailable)",
         "summary": f"{tier} confidence incident near {ev['area']}. Evidence: " + "; ".join(reasons) + ".",
@@ -124,6 +159,10 @@ def fallback(ev, tier, reasons):
                           "Verify which customers sit behind the affected equipment"],
         "sms_en": None, "sms_fil": None,
     }
+    if tickets and not has_network_evidence(ev) and billing_share(tickets) >= 0.6:
+        out["route_to"] = "billing"
+    else:
+        out["route_to"] = "NOC" if tier != "LOW" else "none"
     if tier == "HIGH":
         out["sms_en"] = ("We are aware of a service problem in your area and our team is working "
                          "on it. We will send an update as soon as we have one.")
@@ -145,10 +184,14 @@ Reply with ONLY a JSON object with these keys:
 "what_to_check": list of 2-3 concrete checks that would confirm or rule out the cause.
 "sms_en": a short customer SMS in English, or null.
 "sms_fil": the same SMS in Filipino, or null.
+"route_to": one of "NOC", "billing", "care", "none".
 Rules:
 - If tier is not HIGH, "sms_en" and "sms_fil" MUST be null.
 - Never state a repair time unless typical_repair_hours is not null; if it is null, give no time at all.
-- Never claim a cause as certain unless the tier is HIGH."""
+- Never claim a cause as certain unless the tier is HIGH.
+- Use "billing" only if the sample tickets are mostly about bills or charges AND the facts show no network
+  evidence (few silent routers, no alarm). In that case say plainly in the summary that this does not look
+  like a network fault."""
     msg = client.messages.create(model=MODEL, max_tokens=800,
                                  messages=[{"role": "user", "content": prompt}])
     text = msg.content[0].text
@@ -161,6 +204,12 @@ Rules:
                 raise ValueError("Draft invented a time estimate")
     for key in ("summary", "what_to_check", "sms_en", "sms_fil"):
         data.setdefault(key, None)
+    rt = data.get("route_to")
+    if rt not in ("NOC", "billing", "care", "none"):
+        rt = "NOC" if tier != "LOW" else "none"
+    if rt == "billing" and has_network_evidence(ev):
+        rt = "NOC"  # the AI may not talk us out of real network evidence
+    data["route_to"] = rt
     data["source"] = "Claude"
     return data
 
@@ -171,7 +220,7 @@ def analyse(ev, tier, reasons, tickets, simulate_outage=False):
             raise RuntimeError("Simulated AI outage (sidebar switch is on)")
         return ask_claude(ev, tier, reasons, tickets)
     except Exception as e:  # missing key, API down, bad JSON, failed guardrail
-        res = fallback(ev, tier, reasons)
+        res = fallback(ev, tier, reasons, tickets)
         res["error"] = str(e)[:200]
         return res
 
@@ -244,6 +293,11 @@ def main():
         st.write("**Sample tickets:**")
         for t in tickets:
             st.write(f"- {t}")
+        bs = billing_share(tickets)
+        if bs >= 0.6 and not has_network_evidence(ev):
+            st.info(f"Routing hint (keyword check): {bs:.0%} of the sample tickets mention bills or charges "
+                    "and the network looks healthy. This is likely NOT a network fault: send it to billing "
+                    "and do not send an outage message.")
 
     key = f"res_{choice}_{minute}_{sim_fail}"
     if st.button("Analyse with AI"):
@@ -258,6 +312,9 @@ def main():
         st.write("**What I'd check:**")
         for c in res["what_to_check"] or []:
             st.write("- " + c)
+        ROUTES = {"NOC": "Network operations", "billing": "Billing team (not a network fault)",
+                  "care": "Customer care", "none": "No action yet; keep watching"}
+        st.write("**Suggested routing:** " + ROUTES.get(res.get("route_to"), "No action yet; keep watching"))
         if res["sms_en"]:
             st.write("**Draft SMS (English):** " + res["sms_en"])
             if res["sms_fil"]:
@@ -303,7 +360,14 @@ def main():
 
     r = incident_value(frames, p)
     if r is None:
-        st.info("This incident never reaches HIGH confidence in the replay, so no value is claimed.")
+        naive = next((f for f in frames if f["tickets_last_15min"] >= 20), None)
+        if naive:
+            st.warning(f"A detector that only watches complaint volume would have raised an outage alert at "
+                       f"minute {naive['minute']} and told about {naive['routers_total']} customers there is a "
+                       "network problem when there is none. This system held back and flagged it as a likely "
+                       "billing issue. No savings are claimed here; the value is the wrong alert avoided.")
+        else:
+            st.info("This incident never reaches HIGH confidence in the replay, so no value is claimed.")
     else:
         m1, m2, m3 = st.columns(3)
         m1.metric("Contacts expected", f"{r['contacts']:.0f}")
