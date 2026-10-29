@@ -176,6 +176,48 @@ def analyse(ev, tier, reasons, tickets, simulate_outage=False):
         return res
 
 
+# ---------- 4b. RESULTS MODEL (transparent arithmetic, invented inputs) ----------
+DEFAULTS = dict(contact_pct=33, cost=2.50, defl_notified_pct=50, defl_today_pct=20,
+                window=120, delay=3, ivr_delay=50, incidents_month=1500)
+
+
+def _share_after(t, window):
+    """Share of customer contacts that arrive after minute t (contacts spread evenly over the window)."""
+    return max(0.0, window - t) / window
+
+
+def incident_value(frames, p):
+    first_high, alarm = lead_time(frames)
+    if first_high is None or alarm is None:
+        return None
+    hi = next(f for f in frames if f["minute"] == first_high)
+    contacts = hi["routers_total"] * p["contact_pct"] / 100
+    sys_t = first_high + p["delay"]
+    today_t = alarm + p["ivr_delay"]
+    avoided_sys = (contacts * _share_after(sys_t, p["window"])
+                   * p["defl_notified_pct"] / 100 * hi["map_accuracy"])
+    avoided_today = contacts * _share_after(today_t, p["window"]) * p["defl_today_pct"] / 100
+    net = avoided_sys - avoided_today
+    per_incident = net * p["cost"]
+    return dict(contacts=contacts, sys_t=sys_t, today_t=today_t, avoided_sys=avoided_sys,
+                net=net, per_incident=per_incident,
+                annual=per_incident * p["incidents_month"] * 12)
+
+
+def early_broadcast(frames, p):
+    """What if we had messaged customers at the very first sign instead of waiting for HIGH?"""
+    r = incident_value(frames, p)
+    first = next((f for f in frames if f["routers_silent"] > 0), None)
+    if r is None or first is None:
+        return None
+    contacts = first["routers_total"] * p["contact_pct"] / 100
+    early = (contacts * _share_after(first["minute"] + p["delay"], p["window"])
+             * p["defl_notified_pct"] / 100 * first["map_accuracy"])
+    extra = early - r["avoided_sys"]
+    return dict(minute=first["minute"], extra_contacts=extra, extra_dollars=extra * p["cost"],
+                wrongly_told=round(first["routers_total"] * (1 - first["map_accuracy"])))
+
+
 # ---------- 5. SCREEN ----------
 def main():
     st.set_page_config(page_title="Outage Early-Warning (demo)")
@@ -243,6 +285,63 @@ def main():
               for f in frames])
     st.caption("All times and counts are invented for illustration. The head start compares the "
                "system with the moment a network alarm appears in this simulation, not with real NOC data.")
+
+    # ----- results panel -----
+    st.divider()
+    st.subheader("What this incident is worth (simulated)")
+    p = dict(DEFAULTS)
+    with st.expander("Assumptions behind these numbers (change them and watch the results move)"):
+        a1, a2 = st.columns(2)
+        p["contact_pct"] = a1.number_input("Affected customers who contact care (%)", 5, 100, DEFAULTS["contact_pct"])
+        p["cost"] = a2.number_input("Cost per care contact ($)", 0.5, 20.0, DEFAULTS["cost"], 0.5)
+        p["defl_notified_pct"] = a1.number_input("Contacts avoided when told before they call (%)", 0, 100, DEFAULTS["defl_notified_pct"])
+        p["defl_today_pct"] = a2.number_input("Contacts avoided by today's generic phone message (%)", 0, 100, DEFAULTS["defl_today_pct"])
+        p["window"] = a1.number_input("Minutes over which contacts arrive", 30, 480, DEFAULTS["window"])
+        p["delay"] = a2.number_input("Minutes from HIGH to customer message (approval + delivery)", 0, 30, DEFAULTS["delay"])
+        p["ivr_delay"] = a1.number_input("Minutes from NOC alarm to today's first customer information", 0, 240, DEFAULTS["ivr_delay"])
+        p["incidents_month"] = a2.number_input("Network incidents per month", 100, 10000, DEFAULTS["incidents_month"], 100)
+
+    r = incident_value(frames, p)
+    if r is None:
+        st.info("This incident never reaches HIGH confidence in the replay, so no value is claimed.")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Contacts expected", f"{r['contacts']:.0f}")
+        m2.metric("Contacts avoided (net)", f"{r['net']:.0f}", f"{r['net'] / r['contacts']:.0%} of expected", delta_color="off")
+        m3.metric("Care cost saved", f"${r['per_incident']:.0f}")
+        st.write(f"The system would message customers around **minute {r['sys_t']}**. Today, the first "
+                 f"useful customer information arrives around **minute {r['today_t']}**. "
+                 f"Contacts are assumed to arrive evenly over {p['window']} minutes, so every minute "
+                 "earlier removes a slice of them.")
+
+    st.write("**Both scenarios side by side**")
+    rows = []
+    for name, fr in FRAMES.items():
+        v = incident_value(fr, p)
+        if v:
+            rows.append({"Scenario": name, "Message at (min)": v["sys_t"],
+                         "Today's first info at (min)": v["today_t"],
+                         "Contacts avoided": round(v["net"], 1),
+                         "Saved per incident": f"${v['per_incident']:.0f}",
+                         "If EVERY incident looked like this, per year": f"${v['annual']:,.0f}"})
+    st.table(rows)
+    st.caption("Reference: the Part 1 model assumed about 35% of outage contacts avoided, about $0.95M a year "
+               "gross, for 1,500 incidents a month. Scenario A lands close to that because this timeline "
+               "model was built to be consistent with it. That is a consistency check, not independent "
+               "evidence. Scenario B is lower because its map is less accurate and the evidence arrives later. "
+               "Running costs (SMS, AI) are not subtracted here.")
+
+    eb = early_broadcast(frames, p)
+    if eb:
+        st.write("**Why not message at the first sign of trouble?**")
+        e1, e2 = st.columns(2)
+        e1.metric(f"Extra contacts avoided by messaging at minute {eb['minute']}",
+                  f"{eb['extra_contacts']:.1f}", f"about ${eb['extra_dollars']:.0f}", delta_color="off")
+        e2.metric("Customers possibly told wrongly at that moment", f"{eb['wrongly_told']}")
+        st.caption("Waiting for stronger evidence costs little in this model, while a wrong message goes to "
+                   "people who are not affected. This ignores the chance the first sign is a false alarm, "
+                   "which would make early messaging look worse. The right threshold must be set from real "
+                   "incident history.")
 
 
 main()
